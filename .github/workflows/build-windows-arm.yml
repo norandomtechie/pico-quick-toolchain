@@ -1,0 +1,137 @@
+# Manually started action to build Picotool/OpenOCD for Windows and upload to an artifact
+
+name: Build Windows ARM64
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: msys2 {0}
+    strategy:
+      matrix:
+        include:
+          - { sys: clangarm64, env: clang-aarch64 }
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{matrix.sys}}
+        install: development mingw-w64-${{matrix.env}}-make mingw-w64-${{matrix.env}}-pkg-config mingw-w64-${{matrix.env}}-autotools texinfo mingw-w64-${{matrix.env}}-hidapi git mingw-w64-${{matrix.env}}-toolchain patch mingw-w64-${{matrix.env}}-cmake mingw-w64-${{matrix.env}}-libusb pkg-config zip
+
+    - name: Build Picotool ${{matrix.env}}
+      run: |
+        sdktag=$(grep PICOSDK_BRANCH Makefile | head -1 | awk '{print $3}')
+        picotooltag=$(grep PICOTOOL_BRANCH Makefile | head -1 | awk '{print $3}')
+        echo SDK=$sdktag PICOTOOL=$picotooltag
+
+        pushd .
+
+        # Get the SDK ready
+        git clone https://github.com/raspberrypi/pico-sdk.git
+        cd pico-sdk
+        git checkout $sdktag
+        git submodule update --init
+        cd ..
+
+        # Check out this branch
+        git clone https://github.com/raspberrypi/picotool.git
+        cd picotool
+        git checkout $picotooltag
+        export gitrev=$(git rev-parse --short HEAD)
+
+        # Make static-only binary
+        export LDFLAGS="-Wl,-static -static-libgcc -static-libstdc++"
+
+        # Build!
+        mkdir build
+        cd build
+        cmake -G"MSYS Makefiles" -DPICO_SDK_PATH=../../pico-sdk -S .. -B .
+        make -j VERBOSE=1
+        strip picotool.exe
+
+        # Package
+        mkdir /tmp/picotool
+        # NOTE: For aarch64, you will need to define the pioarch and piotup variables
+        if [ ${{matrix.env}} == clang-aarch64 ]; then export pioarch=windows_arm64; export piotup=aarch64-w64-mingw32; fi
+        if [ ${{matrix.env}} == i686 ]; then export pioarch=windows_x86; export piotup=i686-w64-mingw32; fi
+        if [ ${{matrix.env}} == x86_64 ]; then export pioarch=windows_amd64; export piotup=x86_64-w64-mingw32; fi
+
+        cp -a picotool.exe /tmp/picotool/.
+        cp -a ../LICENSE.TXT /tmp/picotool/.
+        cp -a ../README.md /tmp/picotool/.
+        echo -e '{\n  "description": "picotool-utility",\n  "name": "tool-picotool-rp2040-earlephilhower",\n  "system": [ "'$pioarch'" ],\n  "url": "https://github.com/earlephilhower/pico-quick-toolchain",\n  "version": "5.120300.'$(date +%y%m%d)'"\n}'  > /tmp/picotool/package.json
+        pushd /tmp; zip -9r /tmp/$piotup.picotool-$gitrev.$(date +%y%m%d).zip picotool; popd
+        tar cvf ../../picotool.${{matrix.env}}.tar -C /tmp $piotup.picotool-$gitrev.$(date +%y%m%d).zip
+        popd
+
+    - name: Upload Picotool ${{matrix.env}}
+      uses: actions/upload-artifact@v4
+      with:
+        name: picotool.${{matrix.env}}.tar
+        path: picotool.${{matrix.env}}.tar
+
+    - name: Build OpenOCD ${{matrix.env}}
+      run: |
+        openocdtag=$(grep OPENOCD_BRANCH Makefile | head -1 | awk '{print $3}')
+        echo OPENOCD=$openocdtag
+
+        # Set architecture-specific variables needed for configure and packaging
+        if [ ${{matrix.env}} == clang-aarch64 ]; then export pioarch=windows_arm64; export piotup=aarch64-w64-mingw32; fi
+        if [ ${{matrix.env}} == i686 ]; then export pioarch=windows_x86; export piotup=i686-w64-mingw32; fi
+        if [ ${{matrix.env}} == x86_64 ]; then export pioarch=windows_amd64; export piotup=x86_64-w64-mingw32; fi
+
+        git clone https://github.com/raspberrypi/openocd.git
+        pushd openocd
+        git checkout $openocdtag
+        export gitrev=$(git rev-parse --short HEAD)
+
+        # Apply patches
+        for p in ../patches/openocd-*.patch; do
+          echo PATCH: Applying $p
+          patch -s -p1 < $p
+        done
+
+        # Build!
+        bash bootstrap
+        # Explicitly set the host to prevent compiling x86 assembly on ARM64
+        ./configure --host=$piotup --build=$piotup --target=$piotup --is-mingw=no --prefix=/tmp/openocd --enable-picoprobe --enable-cmsis-dap-v2 --enable-cmsis-dap \
+                      --disable-dummy --disable-rshim --disable-ftdi  --disable-stlink --disable-ti-icdi \
+                      --disable-ulink --disable-usb-blaster-2 --disable-ft232r --disable-vsllink \
+                      --disable-xds110  --disable-osbdm --disable-opendous --disable-aice --disable-usbprog \
+                      --disable-rlink --disable-armjtagew --disable-nulink --disable-kitprog \
+                      --disable-usb-blaster --disable-presto --disable-openjtag --disable-jlink \
+                      --disable-parport --disable-parport-ppdev --disable-parport-giveio --disable-jtag_vpi \
+                      --disable-jtag_dpi --disable-amtjtagaccel --disable-zy1000-master --disable-zy1000 \
+                      --disable-ioutil --disable-bcm2835gpio --disable-imx_gpio --disable-ep93xx \
+                      --disable-at91rm9200 --disable-gw16012 --disable-oocd_trace --disable-buspirate \
+                      --disable-sysfsgpio --disable-xlnx-pcie-xvc --disable-minidriver-dummy \
+                      --disable-remote-bitbang --disable-werror
+
+        # RP2040 has "UINT" but it's not defined anywhere here.  Yay
+        echo "typedef unsigned int uint;" >> config.h
+
+        # Make static-only binary
+        export LDFLAGS="-Wl,-static -static-libgcc -static-libstdc++"
+
+        make -j
+        make install
+        echo Copying needed DLLs and packaging as tarball
+
+        # Copy needed DLLs. These come from the MSYS2 environment now.
+        cp /${{matrix.sys}}/bin/libhidapi-0.dll /tmp/openocd/bin/.
+        cp /${{matrix.sys}}/bin/libusb-1.0.dll /tmp/openocd/bin/.
+
+        popd
+        strip /tmp/openocd/bin/openocd.exe
+        echo -e '{\n  "description": "openocd-utility",\n  "name": "tool-openocd-rp2040-earlephilhower",\n  "system": [ "'$pioarch'" ],\n  "url": "https://github.com/earlephilhower/pico-quick-toolchain",\n  "version": "5.120300.'$(date +%y%m%d)'"\n}'  > /tmp/openocd/package.json
+        pushd /tmp; zip -9r /tmp/$piotup.openocd-$gitrev.$(date +%y%m%d).zip openocd; popd
+        tar cvf openocd.${{matrix.env}}.tar -C /tmp $piotup.openocd-$gitrev.$(date +%y%m%d).zip
+    
+    - name: Upload OpenOCD ${{matrix.env}}
+      uses: actions/upload-artifact@v4
+      with:
+        name: openocd.${{matrix.env}}.tar
+        path: openocd.${{matrix.env}}.tar
